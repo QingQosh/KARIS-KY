@@ -25,6 +25,9 @@ import {
   type EscrowEvent,
   type SorobanEventPage,
   type EscrowEventSubscriptionOptions,
+  type CheckEscrowHealth,
+  type EscrowHealth,
+  type InvestorCapStatus,
   SCHEMA_VERSION,
   CONTRACT_INTERFACE_VERSION,
   MAX_INVOICE_ID_STRING_LEN,
@@ -355,6 +358,33 @@ export class EscrowClient {
 
   async hasMaturityLock(): Promise<boolean> {
     return this.simulate("has_maturity_lock", []);
+  }
+
+  /**
+   * Perform a quick health check on the escrow.
+   *
+   * Returns a lightweight summary with warning type, funded ratio, and time-to-maturity.
+   * Suitable for dashboard displays and monitoring UIs.
+   *
+   * @returns CheckEscrowHealth with warning_type, funded_ratio_bps, and time_to_maturity_secs.
+   */
+  async checkEscrowHealth(): Promise<CheckEscrowHealth> {
+    return this.simulate("check_escrow_health", []);
+  }
+
+  /**
+   * Get comprehensive escrow health diagnostic information.
+   *
+   * Returns full health details including warning type, funding ratio, maturity timeline,
+   * status labels, and legal hold / maturity lock status. Suitable for detailed health
+   * monitoring dashboards and operator UIs.
+   *
+   * @returns EscrowHealth with all diagnostic fields including warning_type, funded_ratio_bps,
+   *          time_to_maturity_secs, status_label, is_maturity_locked, is_legal_held, and
+   *          unique_funder_count.
+   */
+  async getEscrowHealth(): Promise<EscrowHealth> {
+    return this.simulate("get_escrow_health", []);
   }
 
   /**
