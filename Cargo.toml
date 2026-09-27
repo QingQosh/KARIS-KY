@@ -1,5 +1,5 @@
 [workspace]
-members = ["escrow"]
+members = ["escrow", "repl-cli"]
 resolver = "2"
 
 [workspace.metadata.cargo-llvm-cov]

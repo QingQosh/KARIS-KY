@@ -1,437 +1,324 @@
-//! Interactive REPL CLI for karis-ky escrow contract inspection (MVP)
-//!
-//! This is a minimal viable product supporting four key commands:
-//! - `get_escrow`: Fetch current escrow state
-//! - `get_version`: Fetch schema version
-//! - `is_dispute_paused`: Check if dispute pause is active
-//! - `get_attestation_log`: Fetch attestation digests
-//! - `export_state`: Export complete state snapshot
-//! - `trace_tier_selection <lock_secs>`: Show which yield tiers a commitment qualifies for
-//!
-//! All output is pretty-printed JSON for easy parsing and display.
-//!
-//! Usage:
-//!   escrow-repl --network <network> --contract <contract-id>
-//!
-//! Example:
-//!   escrow-repl --network testnet --contract CBXYZ...
-//!   escrow> get_escrow
-//!   escrow> export_state | jq .
-
-use clap::Parser;
+use anyhow::{anyhow, Result};
+use colored::Colorize;
 use rustyline::DefaultEditor;
 use serde_json::json;
 use std::collections::HashMap;
 
-/// Built-in network presets mapping to their default Soroban RPC endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Network {
-    Local,
-    Testnet,
-    Mainnet,
-}
-
-impl Network {
-    /// Parse a network preset name, returning a helpful error for unknown values.
-    fn parse(value: &str) -> Result<Self, String> {
-        match value.to_ascii_lowercase().as_str() {
-            "local" => Ok(Network::Local),
-            "testnet" => Ok(Network::Testnet),
-            "mainnet" => Ok(Network::Mainnet),
-            other => Err(format!(
-                "Unknown network '{}'. Valid networks are: testnet, mainnet, local.\n\
-                 Use --rpc-url <URL> to target a custom RPC endpoint.",
-                other
-            )),
-        }
-    }
-
-    /// Default RPC endpoint for this network preset.
-    fn rpc_url(&self) -> &'static str {
-        match self {
-            Network::Local => "http://localhost:8000",
-            Network::Testnet => "https://soroban-testnet.stellar.org",
-            Network::Mainnet => "https://soroban-mainnet.stellar.org",
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Network::Local => "local",
-            Network::Testnet => "testnet",
-            Network::Mainnet => "mainnet",
-        }
-    }
-}
-
-#[derive(Parser)]
-#[command(name = "escrow-repl")]
-#[command(about = "Interactive REPL for karis-ky escrow contract inspection", long_about = None)]
-struct Args {
-    /// Network preset (testnet, mainnet, or local)
-    #[arg(long, default_value = "testnet")]
-    network: String,
-
-    /// Contract ID (Soroban contract address)
-    #[arg(long)]
-    contract: Option<String>,
-
-    /// Optional RPC endpoint (overrides the network preset)
-    #[arg(long)]
-    rpc_url: Option<String>,
-}
-
-/// Command enum for REPL commands
-#[derive(Debug)]
-enum ReplCommand {
-    /// Fetch current escrow state
-    GetEscrow,
-    /// Fetch schema version
-    GetVersion,
-    /// Check if dispute pause is active
-    IsDisputePaused,
-    /// Fetch attestation digests
-    GetAttestationLog,
-    /// Export complete state snapshot
-    ExportState,
-    /// List each yield tier and whether a commitment of `lock_secs` qualifies for it
-    TraceTierSelection { lock_secs: Result<u64, String> },
-    /// Show help
+/// Represents a command in the REPL.
+#[derive(Debug, Clone)]
+pub enum Command {
+    CheckHealth,
+    GetHealth,
     Help { topic: Option<String> },
-    /// Exit REPL
     Quit,
-    /// Unknown command
-    Unknown(String),
 }
 
-impl ReplCommand {
-    fn parse(input: &str) -> Self {
-        let trimmed = input.trim();
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-        match parts.first().copied() {
-            Some("get_escrow") | Some("get-escrow") => ReplCommand::GetEscrow,
-            Some("get_version") | Some("get-version") => ReplCommand::GetVersion,
-            Some("is_dispute_paused") | Some("is-dispute-paused") => ReplCommand::IsDisputePaused,
-            Some("get_attestation_log") | Some("get-attestation-log") => {
-                ReplCommand::GetAttestationLog
-            }
-            Some("export_state") | Some("export-state") => ReplCommand::ExportState,
-            Some("trace_tier_selection") | Some("trace-tier-selection") => {
-                let lock_secs = match parts.get(1) {
-                    Some(raw) => raw.parse::<u64>().map_err(|_| {
-                        format!("lock_secs must be a whole number of seconds, got '{raw}'")
-                    }),
-                    None => Err("usage: trace_tier_selection <lock_secs>".to_string()),
-                };
-                ReplCommand::TraceTierSelection { lock_secs }
-            }
-            Some("help") => {
-                let topic = parts.get(1).map(|s| s.to_string());
-                ReplCommand::Help { topic }
-            }
-            Some("quit") | Some("exit") => ReplCommand::Quit,
-            Some("") => return ReplCommand::Unknown("".to_string()),
-            Some(cmd) => ReplCommand::Unknown(cmd.to_string()),
-            None => ReplCommand::Unknown("".to_string()),
-        }
-    }
+/// Health warning codes with descriptions.
+#[derive(Debug, Clone, Copy)]
+pub enum WarningCode {
+    Healthy = 0,
+    LowFundingRatio = 4001,
+    CloseToMaturity = 4002,
+    OverMaturity = 4003,
 }
 
-/// REPL context holding network and contract info
-struct ReplContext {
-    network: String,
-    rpc_url: String,
-    contract_id: String,
-    mock_mode: bool, // For testing/demo without actual RPC
-}
-
-impl ReplContext {
-    fn new(args: &Args) -> Result<Self, String> {
-        let network = Network::parse(&args.network)?;
-
-        // `--rpc-url` overrides the preset's default endpoint.
-        let rpc_url = args
-            .rpc_url
-            .clone()
-            .unwrap_or_else(|| network.rpc_url().to_string());
-
-        let contract_id = args.contract.clone().unwrap_or_else(|| "unknown".to_string());
-        let mock_mode = args.contract.is_none();
-
-        Ok(Self {
-            network: network.as_str().to_string(),
-            rpc_url,
-            contract_id,
-            mock_mode,
-        })
-    }
-
-    /// Execute a REPL command and return the output
-    async fn execute(&self, cmd: ReplCommand) -> Result<String, String> {
-        match cmd {
-            ReplCommand::GetEscrow => self.cmd_get_escrow().await,
-            ReplCommand::GetVersion => self.cmd_get_version().await,
-            ReplCommand::IsDisputePaused => self.cmd_is_dispute_paused().await,
-            ReplCommand::GetAttestationLog => self.cmd_get_attestation_log().await,
-            ReplCommand::ExportState => self.cmd_export_state().await,
-            ReplCommand::TraceTierSelection { lock_secs } => {
-                self.cmd_trace_tier_selection(lock_secs?)
-            }
-            ReplCommand::Help { topic } => Ok(self.cmd_help(topic)),
-            ReplCommand::Quit => Err("QUIT".to_string()),
-            ReplCommand::Unknown(cmd) => Err(format!(
-                "Unknown command: '{}'. Type 'help' for available commands.",
-                cmd
-            )),
+impl WarningCode {
+    fn from_u32(code: u32) -> Self {
+        match code {
+            4001 => WarningCode::LowFundingRatio,
+            4002 => WarningCode::CloseToMaturity,
+            4003 => WarningCode::OverMaturity,
+            _ => WarningCode::Healthy,
         }
     }
 
-    /// Simulate get_escrow (mock data for demo; real implementation would call Soroban RPC)
-    async fn cmd_get_escrow(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "invoice_id": "INV_DEMO_001",
-                "admin": "GADMIN...",
-                "sme_address": "GASME...",
-                "amount": 100_000_000i64,
-                "funded_amount": 95_000_000i64,
-                "yield_bps": 500i64,
-                "status": 1,
-                "status_label": "funded",
-                "maturity": 1700000000u64,
-                "created_at": 1690000000u64,
-                "updated_at": 1690001000u64,
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
-        } else {
-            // TODO: Real implementation would invoke contract via Soroban RPC
-            Err("get_escrow not connected to live RPC yet. Use --rpc-url to override.".to_string())
+    fn description(&self) -> &'static str {
+        match self {
+            WarningCode::Healthy => "Healthy - No warning",
+            WarningCode::LowFundingRatio => "Low Funding Ratio (< 50%)",
+            WarningCode::CloseToMaturity => "Close to Maturity (< 1 day)",
+            WarningCode::OverMaturity => "Over Maturity (past maturity, unfunded)",
         }
     }
 
-    /// Simulate get_version (mock data for demo)
-    async fn cmd_get_version(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "schema_version": 7u32,
-                "contract_version": "0.1.0",
-                "build_timestamp": "2026-08-29T09:15:05Z",
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
-        } else {
-            Err("get_version not connected to live RPC yet. Use --rpc-url to override.".to_string())
-        }
-    }
-
-    /// Simulate is_dispute_paused (mock data for demo)
-    async fn cmd_is_dispute_paused(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "is_paused": false,
-                "pause_reason": null,
-                "pause_ticket_id": null,
-                "paused_at": null,
-                "resumes_at": null,
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
-        } else {
-            Err(
-                "is_dispute_paused not connected to live RPC yet. Use --rpc-url to override."
-                    .to_string(),
-            )
-        }
-    }
-
-    /// Simulate get_attestation_log (mock data for demo)
-    async fn cmd_get_attestation_log(&self) -> Result<String, String> {
-        if self.mock_mode {
-            Ok(serde_json::to_string_pretty(&json!([])).unwrap())
-        } else {
-            Err("get_attestation_log not connected to live RPC yet. Use --rpc-url to override."
-                .to_string())
-        }
-    }
-
-    /// List the yield tier table (mock data for demo) with, per tier, whether a
-    /// commitment of `lock_secs` qualifies for it.
-    fn cmd_trace_tier_selection(&self, lock_secs: u64) -> Result<String, String> {
-        if self.mock_mode {
-            Ok(trace_tier_selection(
-                MOCK_BASE_YIELD_BPS,
-                MOCK_YIELD_TIERS,
-                lock_secs,
-            ))
-        } else {
-            Err(
-                "trace_tier_selection not connected to live RPC yet. Use --rpc-url to override."
-                    .to_string(),
-            )
-        }
-    }
-
-    /// Simulate export_state (mock data for demo)
-    async fn cmd_export_state(&self) -> Result<String, String> {
-        if self.mock_mode {
-            let mock_data = json!({
-                "schema_version": 7u32,
-                "escrow": {
-                    "invoice_id": "INV_DEMO_001",
-                    "admin": "GADMIN...",
-                    "sme_address": "GASME...",
-                    "amount": 100_000_000i64,
-                    "funded_amount": 95_000_000i64,
-                    "yield_bps": 500i64,
-                    "status": 1,
-                },
-                "funding_token": "TOKEN...",
-                "treasury": "GTREASURY...",
-                "legal_hold": false,
-                "unique_funder_count": 42u32,
-                "funding_close_snapshot": {
-                    "total_principal": 95_000_000i64,
-                    "target": 100_000_000i64,
-                    "closed_at": 1690001000u64,
-                    "closed_ledger": 12345u32,
-                },
-            });
-            Ok(serde_json::to_string_pretty(&mock_data).unwrap())
-        } else {
-            Err("export_state not connected to live RPC yet. Use --rpc-url to override.".to_string())
-        }
-    }
-
-    /// Generate help text
-    fn cmd_help(&self, topic: Option<String>) -> String {
-        match topic {
-            Some(t) => match t.as_str() {
-                "get_escrow" => {
-                    "get_escrow — Fetch the current escrow state\n\
-                     Returns: InvoiceEscrow with all fields\n\
-                     Example: get_escrow"
-                        .to_string()
-                }
-                "get_version" => {
-                    "get_version — Fetch the contract schema version\n\
-                     Returns: schema_version, contract_version, build_timestamp\n\
-                     Example: get_version"
-                        .to_string()
-                }
-                "is_dispute_paused" => {
-                    "is_dispute_paused — Check if dispute pause is active\n\
-                     Returns: is_paused, pause_reason, pause_ticket_id, paused_at, resumes_at\n\
-                     Example: is_dispute_paused"
-                        .to_string()
-                }
-                "get_attestation_log" => {
-                    "get_attestation_log — Fetch attestation digests in insertion order\n\
-                     Returns: JSON array of 32-byte digests encoded as hex\n\
-                     Example: escrow> get_attestation_log"
-                        .to_string()
-                }
-                "export_state" => {
-                    "export_state — Export complete state snapshot\n\
-                     Returns: Full contract state as JSON\n\
-                     Example: export_state | jq ."
-                        .to_string()
-                }
-                "trace_tier_selection" => {
-                    "trace_tier_selection <lock_secs> — List each yield tier and whether a commitment\n\
-                     of <lock_secs> seconds qualifies (lock_secs >= the tier's min_lock_secs;\n\
-                     0 means no commitment, so only the base yield applies)\n\
-                     Example: escrow> trace_tier_selection 7776000"
-                        .to_string()
-                }
-                _ => format!("No help available for '{}'", t),
-            },
-            None => {
-                "Available commands:\n\
-                 get_escrow         — Fetch current escrow state\n\
-                 get_version        — Fetch schema version\n\
-                 is_dispute_paused  — Check if dispute pause is active\n\
-                 get_legal_hold     — Check if legal hold is active\n\
-                 export_state       — Export complete state snapshot\n\
-                 trace_tier_selection <lock_secs> — Show which yield tiers qualify\n\
-                 help [command]     — Show help for a command\n\
-                 quit / exit        — Exit the REPL"
-                    .to_string()
-            }
+    fn color_status(&self) -> String {
+        match self {
+            WarningCode::Healthy => "✓ HEALTHY".green().to_string(),
+            WarningCode::LowFundingRatio => "⚠ WARNING".yellow().to_string(),
+            WarningCode::CloseToMaturity => "⚠ WARNING".yellow().to_string(),
+            WarningCode::OverMaturity => "✗ CRITICAL".red().to_string(),
         }
     }
 }
 
-/// Base yield of the mock escrow (matches `get_escrow`'s mock `yield_bps`).
-const MOCK_BASE_YIELD_BPS: i64 = 500;
+/// Parse user input into a command.
+fn parse_command(input: &str) -> Result<Command> {
+    let parts: Vec<&str> = input.trim().split_whitespace().collect();
 
-/// Mock yield tier table as `(min_lock_secs, yield_bps)`: 30, 90 and 180 days.
-const MOCK_YIELD_TIERS: &[(u64, i64)] = &[(2_592_000, 550), (7_776_000, 650), (15_552_000, 800)];
-
-/// One line per tier stating whether a commitment of `lock_secs` qualifies for it.
-/// Mirrors the contract's `effective_yield_for_commitment`: a tier qualifies when
-/// `lock_secs >= min_lock_secs`, and a `lock_secs` of 0 is not a commitment, so no
-/// tier qualifies and only the base yield applies.
-fn trace_tier_selection(base_yield_bps: i64, tiers: &[(u64, i64)], lock_secs: u64) -> String {
-    let mut out = format!("lock_secs {lock_secs}, base yield {base_yield_bps} bps\n");
-    if tiers.is_empty() {
-        out.push_str("no yield tier table: base yield applies\n");
-        return out;
+    match parts.get(0).map(|s| *s) {
+        Some("check_health") => Ok(Command::CheckHealth),
+        Some("get_health") => Ok(Command::GetHealth),
+        Some("help") => {
+            let topic = parts.get(1).map(|s| s.to_string());
+            Ok(Command::Help { topic })
+        }
+        Some("quit") | Some("exit") => Ok(Command::Quit),
+        Some(cmd) if cmd.is_empty() => Err(anyhow!("Empty command")),
+        Some(cmd) => Err(anyhow!("Unknown command: '{}'. Type 'help' for available commands.", cmd)),
+        None => Err(anyhow!("No command provided")),
     }
-    for (i, (min_lock_secs, yield_bps)) in tiers.iter().enumerate() {
-        let qualifies = lock_secs > 0 && lock_secs >= *min_lock_secs;
-        out.push_str(&format!(
-            "tier {i}: min_lock_secs {min_lock_secs}, yield {yield_bps} bps: {}\n",
-            if qualifies {
-                "qualifies"
-            } else {
-                "does not qualify"
+}
+
+/// Mock health check response. In production, this would call the contract.
+struct HealthCheckResponse {
+    warning_type: u32,
+    funded_ratio_bps: i64,
+    time_to_maturity_secs: i64,
+}
+
+impl HealthCheckResponse {
+    /// Simulate calling check_escrow_health contract endpoint.
+    fn from_contract() -> Self {
+        // Mock data - in production would invoke via Soroban RPC
+        HealthCheckResponse {
+            warning_type: 0,
+            funded_ratio_bps: 7500, // 75% funded
+            time_to_maturity_secs: 432_000, // 5 days
+        }
+    }
+}
+
+/// Mock health metrics response. In production, this would call the contract.
+#[derive(Debug, Clone)]
+struct EscrowHealthMetrics {
+    funding_progress_percent: u32,
+    days_to_maturity: i64,
+    unique_investor_count: u32,
+    average_contribution_size: i128,
+    estimated_yield_payout: i128,
+}
+
+impl EscrowHealthMetrics {
+    /// Simulate calling get_escrow_health_metrics contract endpoint.
+    fn from_contract() -> Self {
+        // Mock data - in production would invoke via Soroban RPC
+        EscrowHealthMetrics {
+            funding_progress_percent: 75,
+            days_to_maturity: 5,
+            unique_investor_count: 42,
+            average_contribution_size: 238_095,
+            estimated_yield_payout: 500_000,
+        }
+    }
+}
+
+/// Format and display check_health command output with color coding.
+fn display_check_health(response: &HealthCheckResponse) {
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!("{}", "ESCROW HEALTH CHECK".bright_blue().bold());
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+
+    let warning = WarningCode::from_u32(response.warning_type);
+    println!();
+    println!(
+        "Status: {}",
+        warning.color_status()
+    );
+    println!(
+        "Warning Code: {}",
+        match response.warning_type {
+            0 => format!("{}", response.warning_type).green(),
+            4001 | 4002 | 4004 => format!("{}", response.warning_type).yellow(),
+            4003 => format!("{}", response.warning_type).red(),
+            _ => format!("{}", response.warning_type).normal(),
+        }
+    );
+    println!("Description: {}", warning.description());
+
+    println!();
+    println!("Funding Ratio: {}%", format!("{:.2}%", response.funded_ratio_bps as f64 / 100.0).bright_white());
+    println!("Time to Maturity: {} seconds", format_duration(response.time_to_maturity_secs).bright_white());
+
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+}
+
+/// Format and display get_health command output with detailed metrics.
+fn display_get_health(metrics: &EscrowHealthMetrics) {
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!("{}", "ESCROW HEALTH METRICS".bright_blue().bold());
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+
+    println!();
+    println!(
+        "Funding Progress: {}%",
+        format!("{}", metrics.funding_progress_percent).bright_cyan()
+    );
+    println!(
+        "Days to Maturity: {}",
+        if metrics.days_to_maturity < 0 {
+            format!("{} (past maturity)", metrics.days_to_maturity).red()
+        } else if metrics.days_to_maturity == 0 {
+            format!("0 (no maturity)", ).bright_white()
+        } else {
+            format!("{}", metrics.days_to_maturity).bright_white()
+        }
+    );
+    println!(
+        "Unique Investors: {}",
+        format!("{}", metrics.unique_investor_count).bright_cyan()
+    );
+    println!(
+        "Avg. Contribution: {}",
+        format!("{} stroops", metrics.average_contribution_size).bright_white()
+    );
+    println!(
+        "Est. Yield Payout: {}",
+        format!("{} stroops", metrics.estimated_yield_payout).bright_white()
+    );
+
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════".bright_blue());
+    println!();
+}
+
+/// Format duration in seconds to human-readable format.
+fn format_duration(secs: i64) -> String {
+    if secs < 0 {
+        return format!("{} seconds (past)", secs);
+    }
+
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let remaining_secs = secs % 60;
+
+    if days > 0 {
+        format!("{} days, {} hours", days, hours)
+    } else if hours > 0 {
+        format!("{} hours, {} minutes", hours, minutes)
+    } else if minutes > 0 {
+        format!("{} minutes, {} seconds", minutes, remaining_secs)
+    } else {
+        format!("{} seconds", remaining_secs)
+    }
+}
+
+/// Display help information.
+fn display_help(topic: Option<&str>) {
+    println!();
+    println!("{}", "╔═══════════════════════════════════════════════════════╗".bright_blue());
+    println!("{}", "║              KARIS-KY REPL CLI - HELP                  ║".bright_blue());
+    println!("{}", "╚═══════════════════════════════════════════════════════╝".bright_blue());
+    println!();
+
+    match topic {
+        Some("check_health") => {
+            println!("{}:", "check_health".bright_cyan().bold());
+            println!("  Display quick health status of the escrow contract.");
+            println!("  Returns: warning_type, funded_ratio_bps, time_to_maturity_secs");
+            println!();
+            println!("{}:", "Color Coding".bright_yellow());
+            println!("  {} - No warning detected", "✓ GREEN".green());
+            println!("  {} - Low funding or close to maturity", "⚠ YELLOW".yellow());
+            println!("  {} - Critical: over maturity and unfunded", "✗ RED".red());
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > check_health");
+            println!();
+        }
+        Some("get_health") => {
+            println!("{}:", "get_health".bright_cyan().bold());
+            println!("  Display detailed health metrics of the escrow contract.");
+            println!("  Returns: funding_progress_percent, days_to_maturity, unique_investor_count,");
+            println!("           average_contribution_size, estimated_yield_payout");
+            println!();
+            println!("{}:", "Usage".bright_cyan());
+            println!("  > get_health");
+            println!();
+        }
+        _ => {
+            println!("Available commands:");
+            println!();
+            println!("  {} - Check escrow health status (quick overview)", "check_health".bright_cyan());
+            println!("  {} - Get detailed health metrics", "get_health".bright_cyan());
+            println!("  {} - Display this help message", "help [command]".bright_cyan());
+            println!("  {} - Exit the REPL", "quit/exit".bright_cyan());
+            println!();
+            println!("For more information on a command, type: {}", "help <command>".bright_cyan());
+            println!();
+        }
+    }
+}
+
+/// Main REPL loop.
+async fn run_repl() -> Result<()> {
+    let mut rl = DefaultEditor::new()?;
+
+    println!();
+    println!("{}", "╔═══════════════════════════════════════════════════════╗".bright_blue());
+    println!("{}", "║          KARIS-KY ESCROW REPL CLI - Health Check      ║".bright_blue());
+    println!("{}", "║                    Version 0.1.0                       ║".bright_blue());
+    println!("{}", "╚═══════════════════════════════════════════════════════╝".bright_blue());
+    println!();
+    println!("Type {} for help.\n", "'help'".bright_cyan());
+
+    loop {
+        let readline = rl.readline(&format!("{} ", "repl-cli>".bright_cyan()));
+
+        match readline {
+            Ok(line) => {
+                rl.add_history_entry(line.as_str())?;
+                let trimmed = line.trim();
+
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                match parse_command(trimmed) {
+                    Ok(Command::CheckHealth) => {
+                        let response = HealthCheckResponse::from_contract();
+                        display_check_health(&response);
+                    }
+                    Ok(Command::GetHealth) => {
+                        let metrics = EscrowHealthMetrics::from_contract();
+                        display_get_health(&metrics);
+                    }
+                    Ok(Command::Help { topic }) => {
+                        display_help(topic.as_deref());
+                    }
+                    Ok(Command::Quit) => {
+                        println!("Goodbye!");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("{} {}", "Error:".red(), e);
+                    }
+                }
             }
-        ));
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("^C");
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("Goodbye!");
+                break;
+            }
+            Err(e) => {
+                eprintln!("REPL Error: {}", e);
+                break;
+            }
+        }
     }
-    out
+
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
-    let args = Args::parse();
-
-    let ctx = match ReplContext::new(&args) {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            eprintln!("Error: {}", err);
-            std::process::exit(2);
-        }
-    };
-
-    println!("escrow-repl — network: {}", ctx.network);
-    println!("RPC endpoint: {}", ctx.rpc_url);
-    println!("Contract: {}", ctx.contract_id);
-    if ctx.mock_mode {
-        println!("Running in mock mode (no --contract supplied).");
-    }
-    println!("Type 'help' for available commands, 'quit' to exit.\n");
-
-    let mut rl = match DefaultEditor::new() {
-        Ok(rl) => rl,
-        Err(err) => {
-            eprintln!("Failed to initialize REPL: {}", err);
-            std::process::exit(1);
-        }
-    };
-
-    loop {
-        match rl.readline("escrow> ") {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                let cmd = ReplCommand::parse(&line);
-                match ctx.execute(cmd).await {
-                    Ok(output) => println!("{}", output),
-                    Err(err) if err == "QUIT" => break,
-                    Err(err) => eprintln!("Error: {}", err),
-                }
-            }
-            Err(_) => break,
-        }
-    }
+async fn main() -> Result<()> {
+    run_repl().await
 }
 
 #[cfg(test)]
