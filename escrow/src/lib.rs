@@ -2378,12 +2378,18 @@ impl LiquifactEscrow {
         if escrow.status == 0 && escrow.funded_amount >= escrow.funding_target {
             escrow.status = 1;
             if !env.storage().instance().has(&DataKey::FundingCloseSnapshot) {
+                let seq = env.ledger().sequence();
                 let snap = FundingCloseSnapshot {
                     total_principal: escrow.funded_amount,
                     funding_target: escrow.funding_target,
                     closed_at_ledger_timestamp: env.ledger().timestamp(),
-                    closed_at_ledger_sequence: env.ledger().sequence(),
+                    closed_at_ledger_sequence: seq,
                 };
+                // Defensive assertion: verify ledger_sequence consistency
+                debug_assert_eq!(
+                    snap.closed_at_ledger_sequence, seq,
+                    "FundingCloseSnapshot ledger_sequence must match env.ledger().sequence()"
+                );
                 env.storage()
                     .instance()
                     .set(&DataKey::FundingCloseSnapshot, &snap);
@@ -2454,12 +2460,18 @@ impl LiquifactEscrow {
 
         // Write FundingCloseSnapshot if not already present.
         if !env.storage().instance().has(&DataKey::FundingCloseSnapshot) {
+            let seq = env.ledger().sequence();
             let snap = FundingCloseSnapshot {
                 total_principal: escrow.funded_amount,
                 funding_target: escrow.funding_target,
                 closed_at_ledger_timestamp: env.ledger().timestamp(),
-                closed_at_ledger_sequence: env.ledger().sequence(),
+                closed_at_ledger_sequence: seq,
             };
+            // Defensive assertion: verify ledger_sequence consistency
+            debug_assert_eq!(
+                snap.closed_at_ledger_sequence, seq,
+                "FundingCloseSnapshot ledger_sequence must match env.ledger().sequence()"
+            );
             env.storage()
                 .instance()
                 .set(&DataKey::FundingCloseSnapshot, &snap);
