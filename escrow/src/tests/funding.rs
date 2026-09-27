@@ -4086,3 +4086,143 @@ fn test_funding_close_snapshot_no_maturity_constraint() {
         "Time to maturity should be i64::MAX when no maturity constraint"
     );
 }
+
+// --- MinContributionFloor validation tests (CENTRALIZED SEMANTICS) ---
+
+/// Test 1: Zero amount rejection with no floor set (floor defaults to 0).
+/// Even though floor is absent (None), zero amounts must always be rejected.
+#[test]
+#[should_panic(expected = "FundingAmountNotPositive")]
+fn test_min_floor_zero_amount_no_floor_set() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    
+    client.init(
+        &admin,
+        &String::from_str(&env, "MINFLOOR_TEST_1"),
+        &sme,
+        &100_000_000_000i128,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None, // No min contribution floor (absent)
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    // Zero amount must be rejected, even with no floor set
+    client.fund(&investor, &0i128);
+}
+
+/// Test 2: Zero amount rejection with floor explicitly set.
+/// Zero amounts must always be rejected independently of floor value.
+#[test]
+#[should_panic(expected = "FundingAmountNotPositive")]
+fn test_min_floor_zero_amount_with_floor_set() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    
+    let floor = 1_000i128;
+    client.init(
+        &admin,
+        &String::from_str(&env, "MINFLOOR_TEST_2"),
+        &sme,
+        &100_000_000_000i128,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &Some(floor), // Min contribution floor explicitly set
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    // Zero amount must be rejected, even when checking floor
+    client.fund(&investor, &0i128);
+}
+
+/// Test 3: Amount below floor rejected with FundingBelowMinContribution.
+/// Amounts must always be >= floor (floor defaults to 0 when absent).
+#[test]
+#[should_panic(expected = "FundingBelowMinContribution")]
+fn test_min_floor_below_floor_rejected() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    
+    let floor = 5_000i128;
+    client.init(
+        &admin,
+        &String::from_str(&env, "MINFLOOR_TEST_3"),
+        &sme,
+        &100_000_000_000i128,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &Some(floor),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    // Amount below floor (but > 0) must be rejected with specific error
+    client.fund(&investor, &(floor - 1));
+}
+
+/// Test 4: Amount exactly at floor accepted.
+/// Amounts >= floor must be accepted (boundary condition).
+#[test]
+fn test_min_floor_exactly_at_floor_accepted() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    
+    let floor = 5_000i128;
+    client.init(
+        &admin,
+        &String::from_str(&env, "MINFLOOR_TEST_4"),
+        &sme,
+        &100_000_000_000i128,
+        &800i64,
+        &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
+        &None,
+        &Some(floor),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    let investor = Address::generate(&env);
+    // Amount exactly at floor must be accepted
+    client.fund(&investor, &floor);
+    
+    // Verify the contribution was recorded
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.funded_amount, floor);
+}
