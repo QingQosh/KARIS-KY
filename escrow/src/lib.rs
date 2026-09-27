@@ -826,10 +826,14 @@ pub enum DataKey {
     /// Flag indicating whether automatic yield distribution snapshots are enabled for this escrow.
     /// Absent ⇒ false (default off, backwards-compatible). Set during [`LiquifactEscrow::init`].
     YieldAutoDistributionEnabled,
-    /// Expiration timestamp for an admin-proposed legal hold awaiting guardian confirmation.
-    /// Absent ⇒ no legal-hold proposal is pending. Appended to preserve existing key discriminants.
-    LegalHoldProposalExpiresAt,
-}
+    /// Optional configurable staleness threshold in seconds for funding-stalled warning (4004).
+    /// When set and escrow is open & underfunded, a warning is emitted if no funding
+    /// has occurred for this duration. Absent ⇒ no stall checking. Set during [`LiquifactEscrow::init`].
+    FundingStallThresholdSecs,
+    /// Ledger timestamp of the last successful fund operation. Updated on every [`LiquifactEscrow::fund`]
+    /// and [`LiquifactEscrow::fund_with_commitment`] call. Used with [`DataKey::FundingStallThresholdSecs`]
+    /// to detect funding staleness. Absent ⇒ never funded.
+    LastFundLedgerTimestamp,
 
 // --- Data types ---
 
@@ -2348,6 +2352,7 @@ impl LiquifactEscrow {
     /// - **Code 4001 (LowFundingRatio)**: `funded_ratio_bps < 5000` (< 50%) and close to/past maturity.
     /// - **Code 4002 (CloseToMaturity)**: `time_to_maturity_secs < 86400` (< 1 day) with healthy funding.
     /// - **Code 4003 (OverMaturity)**: Escrow is past maturity (`time_to_maturity_secs < 0`) and unfunded.
+    /// - **Code 4004 (FundingStalled)**: No new funding for longer than the configured stall threshold while escrow is open and underfunded.
     /// - **Code 0**: No warning condition detected.
     ///
     /// # Non-blocking
@@ -2380,11 +2385,47 @@ impl LiquifactEscrow {
             i64::MAX // No maturity constraint.
         };
 
+        // Check for funding staleness (code 4004).
+        let is_funding_stalled = if escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
+            // Escrow is open and underfunded. Check if a stall threshold is configured.
+            if let Some(stall_threshold_secs) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::FundingStallThresholdSecs)
+            {
+                if stall_threshold_secs > 0 {
+                    // Threshold is configured; check last fund timestamp.
+                    if let Some(last_fund_ts) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, u64>(&DataKey::LastFundLedgerTimestamp)
+                    {
+                        let time_since_last_fund = now.saturating_sub(last_fund_ts);
+                        time_since_last_fund > stall_threshold_secs
+                    } else {
+                        // No funding has occurred yet; check if stalling period has passed since init.
+                        let created_at: u64 = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::CreatedAt)
+                            .unwrap_or(now);
+                        let time_since_creation = now.saturating_sub(created_at);
+                        time_since_creation > stall_threshold_secs
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Determine warning type based on conditions.
-        let warning_type = if time_to_maturity_secs < 0
-            && escrow.status == 0
-            && escrow.funded_amount < escrow.funding_target
-        {
+        let warning_type = if is_funding_stalled {
+            4004 // FundingStalled: no funding activity for threshold duration while underfunded.
+        } else if time_to_maturity_secs < 0 && escrow.status == 0 && escrow.funded_amount < escrow.funding_target {
             4003 // OverMaturity: past maturity, still open, and unfunded.
         } else if time_to_maturity_secs >= 0 && time_to_maturity_secs < 86400 {
             // Close to maturity (< 1 day away).
@@ -2543,113 +2584,7 @@ impl LiquifactEscrow {
         settlement_notifier_contract: Option<Address>,
         kyc_provider_contract: Option<Address>,
         admin_roles: Option<Vec<(Address, AdminRole)>>,
-        reject_contract_admin: Option<bool>,
-    ) -> InvoiceEscrow {
-        Self::init_internal(
-            env,
-            admin,
-            None,
-            invoice_id,
-            sme_address,
-            amount,
-            yield_bps,
-            maturity,
-            funding_token,
-            registry,
-            treasury,
-            yield_tiers,
-            min_contribution,
-            max_unique_investors,
-            max_per_investor,
-            legal_hold_clear_delay,
-            funding_deadline,
-            max_funding_rate,
-            yield_slippage_threshold,
-            settlement_notifier_contract,
-            kyc_provider_contract,
-            admin_roles,
-            reject_contract_admin,
-        )
-    }
-
-    /// Initialize an escrow with a separate legal-hold guardian. Existing deployments and
-    /// callers using [`LiquifactEscrow::init`] remain guardian-free.
-    pub fn init_with_guardian(
-        env: Env,
-        admin: Address,
-        guardian: Address,
-        invoice_id: String,
-        sme_address: Address,
-        amount: i128,
-        yield_bps: i64,
-        maturity: u64,
-        funding_token: Address,
-        registry: Option<Address>,
-        treasury: Address,
-        yield_tiers: Option<Vec<YieldTier>>,
-        min_contribution: Option<i128>,
-        max_unique_investors: Option<u32>,
-        max_per_investor: Option<i128>,
-        legal_hold_clear_delay: Option<u64>,
-        funding_deadline: Option<u64>,
-        max_funding_rate: Option<u64>,
-        yield_slippage_threshold: Option<i64>,
-        settlement_notifier_contract: Option<Address>,
-        kyc_provider_contract: Option<Address>,
-        admin_roles: Option<Vec<(Address, AdminRole)>>,
-        reject_contract_admin: Option<bool>,
-    ) -> InvoiceEscrow {
-        Self::init_internal(
-            env,
-            admin,
-            Some(guardian),
-            invoice_id,
-            sme_address,
-            amount,
-            yield_bps,
-            maturity,
-            funding_token,
-            registry,
-            treasury,
-            yield_tiers,
-            min_contribution,
-            max_unique_investors,
-            max_per_investor,
-            legal_hold_clear_delay,
-            funding_deadline,
-            max_funding_rate,
-            yield_slippage_threshold,
-            settlement_notifier_contract,
-            kyc_provider_contract,
-            admin_roles,
-            reject_contract_admin,
-        )
-    }
-
-    fn init_internal(
-        env: Env,
-        admin: Address,
-        guardian: Option<Address>,
-        invoice_id: String,
-        sme_address: Address,
-        amount: i128,
-        yield_bps: i64,
-        maturity: u64,
-        funding_token: Address,
-        registry: Option<Address>,
-        treasury: Address,
-        yield_tiers: Option<Vec<YieldTier>>,
-        min_contribution: Option<i128>,
-        max_unique_investors: Option<u32>,
-        max_per_investor: Option<i128>,
-        legal_hold_clear_delay: Option<u64>,
-        funding_deadline: Option<u64>,
-        max_funding_rate: Option<u64>,
-        yield_slippage_threshold: Option<i64>,
-        settlement_notifier_contract: Option<Address>,
-        kyc_provider_contract: Option<Address>,
-        admin_roles: Option<Vec<(Address, AdminRole)>>,
-        reject_contract_admin: Option<bool>,
+        funding_stall_threshold_secs: Option<u64>,
     ) -> InvoiceEscrow {
         admin.require_auth();
         if let Some(ref guardian_address) = guardian {
@@ -2850,6 +2785,15 @@ impl LiquifactEscrow {
             env.storage()
                 .instance()
                 .set(&DataKey::SettlementNotifierContract, notifier);
+        }
+
+        // Store optional funding stall threshold for health check warnings (code 4004)
+        if let Some(threshold_secs) = funding_stall_threshold_secs {
+            if threshold_secs > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::FundingStallThresholdSecs, &threshold_secs);
+            }
         }
 
         // Store creation timestamp for registry listings
@@ -5732,6 +5676,11 @@ impl LiquifactEscrow {
         }
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        // Record the timestamp of this successful fund operation for stall detection.
+        env.storage()
+            .instance()
+            .set(&DataKey::LastFundLedgerTimestamp, &env.ledger().timestamp());
 
         EscrowFunded {
             name: symbol_short!("funded"),
