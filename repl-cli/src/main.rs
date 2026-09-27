@@ -320,3 +320,56 @@ async fn run_repl() -> Result<()> {
 async fn main() -> Result<()> {
     run_repl().await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIERS: &[(u64, i64)] = &[(100, 550), (200, 650)];
+
+    #[test]
+    fn trace_lists_every_tier_with_its_qualification() {
+        assert_eq!(
+            trace_tier_selection(500, TIERS, 150),
+            "lock_secs 150, base yield 500 bps\n\
+             tier 0: min_lock_secs 100, yield 550 bps: qualifies\n\
+             tier 1: min_lock_secs 200, yield 650 bps: does not qualify\n"
+        );
+    }
+
+    #[test]
+    fn a_lock_equal_to_min_lock_secs_qualifies() {
+        assert!(trace_tier_selection(500, TIERS, 200)
+            .contains("tier 1: min_lock_secs 200, yield 650 bps: qualifies"));
+    }
+
+    #[test]
+    fn zero_lock_secs_qualifies_for_no_tier() {
+        let trace = trace_tier_selection(500, TIERS, 0);
+        assert!(!trace.contains(": qualifies"), "{trace}");
+    }
+
+    #[test]
+    fn missing_tier_table_says_base_yield_applies() {
+        assert_eq!(
+            trace_tier_selection(500, &[], 300),
+            "lock_secs 300, base yield 500 bps\nno yield tier table: base yield applies\n"
+        );
+    }
+
+    #[test]
+    fn parse_reads_lock_secs_and_rejects_bad_input() {
+        assert!(matches!(
+            ReplCommand::parse("trace_tier_selection 42"),
+            ReplCommand::TraceTierSelection { lock_secs: Ok(42) }
+        ));
+        assert!(matches!(
+            ReplCommand::parse("trace-tier-selection abc"),
+            ReplCommand::TraceTierSelection { lock_secs: Err(_) }
+        ));
+        assert!(matches!(
+            ReplCommand::parse("trace_tier_selection"),
+            ReplCommand::TraceTierSelection { lock_secs: Err(_) }
+        ));
+    }
+}

@@ -28,6 +28,8 @@ export {
   toBaseUnits,
   fromBaseUnits,
   parseResult,
+  HEALTH_CHECK_WARNINGS,
+  HEALTH_CHECK_WARNING_LABELS,
   type InvoiceEscrow,
   type YieldTier,
   type FundingCloseSnapshot,
@@ -44,4 +46,7 @@ export {
   type EscrowEvent,
   type SorobanEventPage,
   type EscrowEventSubscriptionOptions,
+  type CheckEscrowHealth,
+  type EscrowHealth,
+  type InvestorCapStatus,
 } from "./types";

@@ -80,11 +80,33 @@ export interface EscrowSummary {
   attestation_log_length: number;
 }
 
-/** Result of checking whether another distinct investor can contribute. */
+/** Quick health check result returned by check_escrow_health. */
+export interface CheckEscrowHealth {
+  warning_type: string; // Human-readable warning label or "healthy"
+  funded_ratio_bps: string; // i64 → bigint string, basis points (0-10000)
+  time_to_maturity_secs: string; // i64 → bigint string, seconds until maturity
+}
+
+/** Full escrow health diagnostic returned by get_escrow_health. */
+export interface EscrowHealth {
+  warning_type: string; // Human-readable warning label or "healthy"
+  funded_ratio_bps: string; // i64 → bigint string, basis points (0-10000)
+  time_to_maturity_secs: string; // i64 → bigint string, seconds until maturity
+  status_label: string; // Human-readable status (e.g., "Open", "Funded", "Settled")
+  is_maturity_locked: boolean;
+  is_legal_held: boolean;
+  unique_funder_count: number;
+}
+
+/** Investor capacity status returned by get_investor_cap_status. */
 export interface InvestorCapStatus {
+  /** Maximum number of distinct investors allowed (2^32-1 if unlimited). */
   max: number;
+  /** Current number of distinct investors that have contributed. */
   current: number;
+  /** Remaining slots for new investors; 0 means cap reached. */
   remaining: number;
+  /** Whether the investor cap is at maximum. */
   is_full: boolean;
 }
 
@@ -536,3 +558,29 @@ export function parseResult<T>(
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Health check types and utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Health check warning type constants for easy comparison.
+ */
+export const HEALTH_CHECK_WARNINGS = {
+  HEALTHY: "healthy",
+  UNDERFUNDED: "underfunded",
+  APPROACHING_MATURITY: "approaching_maturity",
+  MATURITY_PASSED: "maturity_passed",
+  LEGAL_HOLD: "legal_hold",
+} as const;
+
+/**
+ * Human-readable descriptions for each warning type.
+ */
+export const HEALTH_CHECK_WARNING_LABELS: Record<string, string> = {
+  healthy: "Escrow is healthy with sufficient funding and time",
+  underfunded: "Escrow is underfunded relative to target",
+  approaching_maturity: "Escrow is approaching maturity deadline",
+  maturity_passed: "Escrow maturity has passed or is overdue",
+  legal_hold: "Escrow is under legal hold",
+};
