@@ -5342,20 +5342,27 @@ impl LiquifactEscrow {
     ) -> InvoiceEscrow {
         investor.require_auth();
 
+        // Amounts must always be positive. This check is independent of any floor
+        // and ensures zero contributions are always rejected.
         ensure(&env, amount > 0, EscrowError::FundingAmountNotPositive);
 
+        // Fetch the minimum contribution floor. Absence (None) is semantically equivalent to 0.
+        // This makes the floor validation explicit: amounts must always be >= floor,
+        // and the floor defaults to 0 when not set (absent on older schema versions).
         let floor: i128 = env
             .storage()
             .instance()
             .get(&DataKey::MinContributionFloor)
             .unwrap_or(0);
-        if floor > 0 {
-            ensure(
-                &env,
-                amount >= floor,
-                EscrowError::FundingBelowMinContribution,
-            );
-        }
+
+        // Check that the amount meets or exceeds the floor.
+        // Always applied (not conditional on floor > 0) to make semantics explicit:
+        // the absence-equals-zero policy is centralized here.
+        ensure(
+            &env,
+            amount >= floor,
+            EscrowError::FundingBelowMinContribution,
+        );
 
         // env.clone(): env is used again after this call for storage writes and publish.
         let mut escrow = Self::get_escrow(env.clone());
