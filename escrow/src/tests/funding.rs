@@ -1606,6 +1606,129 @@ fn test_ledger_sequence_recorded_in_snapshot_with_tick() {
 }
 
 #[test]
+fn test_funding_close_snapshot_both_fields_written_correctly() {
+    // Verify that both ledger_timestamp and ledger_sequence are correctly captured
+    // in the snapshot at the moment of the funded transition.
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let inv = Address::generate(&env);
+    let (tok, tre) = free_addresses(&env);
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "SNAP_BOTH_FIELDS_01"),
+        &sme,
+        &2_000i128,
+        &5_000i64,
+        &0u64,
+        &tok,
+        &None,
+        &tre,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Set specific ledger time and sequence before funding
+    let expected_timestamp = 42_000u64;
+    let expected_sequence = 123u32;
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp = expected_timestamp;
+        ledger.sequence_number = expected_sequence;
+    });
+
+    // Fund the escrow to trigger the snapshot write
+    client.fund(&inv, &2_000i128);
+
+    // Verify both fields are correctly written
+    let snap = client
+        .get_funding_close_snapshot()
+        .expect("snapshot must be present after funding");
+    assert_eq!(
+        snap.closed_at_ledger_timestamp, expected_timestamp,
+        "ledger_timestamp must be captured from env.ledger().timestamp()"
+    );
+    assert_eq!(
+        snap.closed_at_ledger_sequence, expected_sequence,
+        "ledger_sequence must be captured from env.ledger().sequence()"
+    );
+
+    // Also verify other snapshot fields are correct
+    assert_eq!(snap.total_principal, 2_000i128);
+    assert_eq!(snap.funding_target, 2_000i128);
+}
+
+#[test]
+fn test_funding_close_snapshot_both_fields_written_after_partial_settle() {
+    // Verify that both ledger_timestamp and ledger_sequence are correctly captured
+    // in the snapshot when written during partial_settle (early close).
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    
+    let inv = Address::generate(&env);
+    let (tok, tre) = free_addresses(&env);
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "SNAP_PARTIAL_SETTLE_01"),
+        &sme,
+        &5_000i128,
+        &8_000i64,
+        &0u64,
+        &tok,
+        &None,
+        &tre,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Partial fund (escrow remains open)
+    client.fund(&inv, &1_000i128);
+    assert_eq!(
+        client.get_funding_close_snapshot(),
+        None,
+        "snapshot must not exist yet for underfunded escrow"
+    );
+
+    // Set specific ledger time and sequence before partial_settle
+    let expected_timestamp = 99_999u64;
+    let expected_sequence = 555u32;
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp = expected_timestamp;
+        ledger.sequence_number = expected_sequence;
+    });
+
+    // Call partial_settle to close funding early
+    client.partial_settle();
+
+    // Verify both fields are correctly written in the snapshot
+    let snap = client
+        .get_funding_close_snapshot()
+        .expect("snapshot must be present after partial_settle");
+    assert_eq!(
+        snap.closed_at_ledger_timestamp, expected_timestamp,
+        "ledger_timestamp must be captured at partial_settle time"
+    );
+    assert_eq!(
+        snap.closed_at_ledger_sequence, expected_sequence,
+        "ledger_sequence must be captured at partial_settle time"
+    );
+
+    // Verify the funded_amount is captured correctly
+    assert_eq!(snap.total_principal, 1_000i128);
+    assert_eq!(snap.funding_target, 5_000i128);
+}
+
+#[test]
 fn test_get_funding_close_snapshot_absent_before_any_funding() {
     // Snapshot must be None immediately after init, before any fund() call.
     let env = Env::default();
