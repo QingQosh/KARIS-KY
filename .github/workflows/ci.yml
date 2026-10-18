@@ -26,6 +26,9 @@ jobs:
       - name: Clippy
         run: cargo clippy -p karis-ky_escrow -- -D warnings
 
+      - name: Clippy REPL CLI
+        run: cargo clippy -p repl-cli -- -D warnings
+
       - name: Build
         run: cargo build
 
@@ -37,6 +40,9 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Test REPL CLI
+        run: cargo test -p repl-cli
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
